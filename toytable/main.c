@@ -383,6 +383,7 @@ void showconnections()
 }
 void showlogs()
 {
+    system("sudo dmesg");
 }
 int main(int argc, char *argv[])
 {
