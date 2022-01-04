@@ -134,7 +134,7 @@ char *port2str(unsigned short port)
     {
         return "any";
     }
-    sprintf(str[i], "%hd", port);
+    sprintf(str[i], "%u", port);
     return str[i];
 }
 void println_rule_title()
@@ -307,8 +307,6 @@ void addrule(int argc, char *argv[])
 
     puts("add rule");
     println_rule_title();
-    println_rule(req.rule);
-    println_rule(req.rule);
     println_rule(req.rule);
 
     if (req.rule.connection.protocol == 0)

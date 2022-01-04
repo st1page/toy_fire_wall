@@ -12,6 +12,7 @@
 #include <net/sock.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
+#include <linux/inet.h>
 
 struct sock *netlink_socket = NULL;
 char *addr2str(unsigned int ip)
@@ -37,7 +38,7 @@ char *port2str(unsigned short port)
     {
         return "any";
     }
-    sprintf(str[i], "%hd", port);
+    sprintf(str[i], "%u", port);
     return str[i];
 }
 void printkln_rule_title(void)
@@ -56,7 +57,17 @@ void printkln_rule(Rule rule)
            state2str(rule.state),
            action2str(rule.action));
 }
-
+void printkln_matches_rule(Rule rule)
+{
+    printk("matches rule{%s:%s => %s:%s proto:%s state:%s action %s}\n",
+           addr2str(rule.connection.saddr),
+           port2str(rule.connection.sport),
+           addr2str(rule.connection.daddr),
+           port2str(rule.connection.dport),
+           proto2str(rule.connection.protocol),
+           state2str(rule.state),
+           action2str(rule.action));
+}
 typedef struct
 {
     struct list_head list;
@@ -64,21 +75,27 @@ typedef struct
 } RuleNode;
 int rule_num = 0;
 LIST_HEAD(rules);
+DEFINE_SPINLOCK(rules_lock);
+
 void add_rule(Rule *rule)
 {
+    unsigned long tmp = 0;
     RuleNode *r = (RuleNode *)kmalloc(sizeof(RuleNode), GFP_KERNEL);
     memcpy(&(r->rule), rule, sizeof(Rule));
+    spin_lock_irqsave(&rules_lock, tmp);
     INIT_LIST_HEAD(&r->list);
     list_add_tail(&(r->list), &rules);
     rule_num++;
+    spin_unlock_irqrestore(&rules_lock, tmp);
 }
 int del_rule(int id)
 {
     struct list_head *p, *n;
     RuleNode *r;
     uint32_t i = 0;
+    unsigned long tmp = 0;
     printk("%d\n", id);
-
+    spin_lock_irqsave(&rules_lock, tmp);
     list_for_each_safe(p, n, &rules)
     {
         if (++i == id)
@@ -87,9 +104,12 @@ int del_rule(int id)
             list_del(p);
             kfree(r);
             rule_num--;
+            spin_unlock_irqrestore(&rules_lock, tmp);
             return 1;
         }
     }
+    spin_unlock_irqrestore(&rules_lock, tmp);
+
     printk("del the rule failed, id=%d\n", id);
     return 0;
 }
@@ -98,47 +118,61 @@ NetlinkResponse *get_rules(void)
     struct list_head *p;
     RuleNode *r;
     uint32_t i = 0;
+    unsigned long tmp = 0;
+
     NetlinkResponse *resp = (NetlinkResponse *)kmalloc(response_size(RESP_RULE, rule_num), GFP_KERNEL);
     resp->cmd = RESP_RULE;
     resp->elem_num = rule_num;
+    spin_lock_irqsave(&rules_lock, tmp);
     list_for_each(p, &rules)
     {
         r = list_entry(p, RuleNode, list);
         memcpy(&(resp->rule[i++]), &(r->rule), sizeof(Rule));
     }
+    spin_unlock_irqrestore(&rules_lock, tmp);
+
     return resp;
 }
 RuleAction default_action = ACCEPT;
-RuleAction match_rule(uint32_t saddr, uint16_t sport, uint32_t daddr, uint16_t dport, Proto protocol)
+
+int match_port(uint16_t port, uint16_t rule_port)
+{
+    port = htons(port);
+    return (port == 0) || (rule_port == 0) || (port == rule_port);
+}
+int match_addr(uint32_t addr, uint32_t rule_addr)
+{
+    return (addr == 0) || (rule_addr == 0) || (addr == rule_addr);
+}
+
+RuleAction tcp_match_rule(uint32_t saddr, uint16_t sport, uint32_t daddr, uint16_t dport)
 {
     struct list_head *c;
     RuleNode *r;
+    ConnectionKey rule_conn;
+    ConnectionState state;
+    RuleAction act;
+    unsigned long tmp = 0;
+    spin_lock_irqsave(&rules_lock, tmp);
+
     list_for_each(c, &rules)
     {
         r = list_entry(c, RuleNode, list);
-        continue;
-        // if ((r->rule.enable & RULE_ENABLE_SADDR) && (r->rule.saddr) != saddr)
-        // {
-        //     continue;
-        // }
-        // if ((r->rule.enable & RULE_ENABLE_SPORT) && (r->rule.sport) != source)
-        // {
-        //     continue;
-        // }
-        // if ((r->rule.enable & RULE_ENABLE_DADDR) && (r->rule.daddr) != daddr)
-        // {
-        //     continue;
-        // }
-        // if ((r->rule.enable & RULE_ENABLE_DPORT) && (r->rule.dport) != dest)
-        // {
-        //     continue;
-        // }
-        // if ((r->rule.enable & RULE_ENABLE_PROTOCOL) && (r->rule.protocol) != protocol)
-        // {
-        //     continue;
-        // }
-        return r->rule.action;
+        rule_conn = r->rule.connection;
+        state = r->rule.state;
+        act = r->rule.action;
+        if (match_addr(saddr, rule_conn.saddr) &&
+            match_addr(daddr, rule_conn.daddr) &&
+            match_port(sport, rule_conn.sport) &&
+            match_port(dport, rule_conn.dport))
+        {
+            printkln_matches_rule(r->rule);
+            spin_unlock_irqrestore(&rules_lock, tmp);
+            return r->rule.action;
+        }
     }
+    spin_unlock_irqrestore(&rules_lock, tmp);
+
     return default_action;
 }
 
@@ -251,28 +285,30 @@ inline unsigned int handle_tcp(struct sk_buff *skb, struct iphdr *ip_header)
     if (tcp_header->syn)
     {
         // TODO: Match Rules
-        printk("NEW TCP Connection %pI4:%hd -> %pI4:%hd",
+        printk("NEW TCP Connection %pI4:%u -> %pI4:%u",
                &ip_header->saddr,
                ntohs(tcp_header->source),
                &ip_header->daddr,
                ntohs(tcp_header->dest));
+        return act2nfact(tcp_match_rule(ip_header->saddr, ip_header->daddr, tcp_header->source,
+                                        tcp_header->dest));
     }
     else
     {
-        printk("TCP Package %pI4:%hd -> %pI4:%hd",
+        printk("TCP Package %pI4:%u -> %pI4:%u",
                &ip_header->saddr,
                ntohs(tcp_header->source),
                &ip_header->daddr,
                ntohs(tcp_header->dest));
-        return act2nfact(match_rule(ip_header->saddr, ip_header->daddr, tcp_header->source,
-                                    tcp_header->dest, TCP));
+        return act2nfact(tcp_match_rule(ip_header->saddr, ip_header->daddr, tcp_header->source,
+                                        tcp_header->dest));
     }
     return act2nfact(default_action);
 }
 int handle_udp(struct sk_buff *skb, struct iphdr *ip_header)
 {
     struct udphdr *udp_header = udp_hdr(skb);
-    printk("UDP Package %pI4:%hd -> %pI4:%hd",
+    printk("UDP Package %pI4:%u -> %pI4:%u",
            &ip_header->saddr,
            ntohs(udp_header->source),
            &ip_header->daddr,
