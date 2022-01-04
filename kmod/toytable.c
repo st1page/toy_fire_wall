@@ -2,6 +2,8 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/skbuff.h>
+#include <linux/list.h>
+#include <linux/sched.h>
 #include <linux/init.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
@@ -144,13 +146,48 @@ int match_addr(uint32_t addr, uint32_t rule_addr)
 {
     return (addr == 0) || (rule_addr == 0) || (addr == rule_addr);
 }
+typedef struct
+{
+    ConnectionKey c;
+    struct hlist_node hlist;
+} ConnNode;
+int conn_num = 0;
+DEFINE_SPINLOCK(conns_lock);
+static DECLARE_HASHTABLE(conn_table, 4);
+uint32_t hash_conn(uint32_t saddr, uint16_t sport, uint32_t daddr, uint16_t dport)
+{
+    return (saddr ^ daddr) ^ (dport) ^ (sport << 16);
+}
+uint32_t hash_conn_c(ConnectionKey *c)
+{
+    return (c->saddr ^ c->daddr) ^ (c->dport) ^ (c->sport << 16);
+}
+NetlinkResponse *get_conns(void)
+{
+    ConnNode *c;
+    uint32_t i = 0;
+    unsigned long tmp = 0;
+    unsigned bkt;
 
-RuleAction tcp_match_rule(uint32_t saddr, uint16_t sport, uint32_t daddr, uint16_t dport)
+    NetlinkResponse *resp = (NetlinkResponse *)kmalloc(response_size(RESP_RULE, conn_num), GFP_KERNEL);
+    resp->cmd = RESP_CONN;
+    resp->elem_num = conn_num;
+    spin_lock_irqsave(&conns_lock, tmp);
+    hash_for_each(conn_table, bkt, c, hlist)
+    {
+        memcpy(&(resp->conn[i++]), c, sizeof(ConnectionKey));
+    }
+    spin_unlock_irqrestore(&conns_lock, tmp);
+
+    return resp;
+}
+
+RuleAction tcp_match_rule(uint32_t saddr, uint16_t sport, uint32_t daddr, uint16_t dport, int is_syn)
 {
     struct list_head *c;
     RuleNode *r;
     ConnectionKey rule_conn;
-    ConnectionState state;
+    ConnectionState rule_state;
     RuleAction act;
     unsigned long tmp = 0;
     spin_lock_irqsave(&rules_lock, tmp);
@@ -159,23 +196,28 @@ RuleAction tcp_match_rule(uint32_t saddr, uint16_t sport, uint32_t daddr, uint16
     {
         r = list_entry(c, RuleNode, list);
         rule_conn = r->rule.connection;
-        state = r->rule.state;
+        rule_state = r->rule.state;
         act = r->rule.action;
         if (match_addr(saddr, rule_conn.saddr) &&
             match_addr(daddr, rule_conn.daddr) &&
             match_port(sport, rule_conn.sport) &&
             match_port(dport, rule_conn.dport))
         {
-            printkln_matches_rule(r->rule);
-            spin_unlock_irqrestore(&rules_lock, tmp);
-            return r->rule.action;
+            if ((is_syn && rule_state == NEW) || (!is_syn && rule_state == ESTABLISHED))
+            {
+                printkln_matches_rule(r->rule);
+                spin_unlock_irqrestore(&rules_lock, tmp);
+                return r->rule.action;
+            }
         }
+        spin_unlock_irqrestore(&rules_lock, tmp);
+
+        return default_action;
     }
     spin_unlock_irqrestore(&rules_lock, tmp);
 
     return default_action;
 }
-
 int netlink_send(void *data, int len, int pid)
 {
     struct sk_buff *skb;
@@ -227,6 +269,8 @@ static void netlink_recv(struct sk_buff *skb)
             {
             case REQ_CONNS:
                 printk("netlink recv cmd show connections\n");
+                resp_ptr = get_conns();
+                netlink_send(resp_ptr, response_size(resp_ptr->cmd, resp_ptr->elem_num), pid);
                 break;
             case REQ_RULES:
                 printk("netlink recv cmd show rules\n");
@@ -282,16 +326,31 @@ int act2nfact(RuleAction action)
 inline unsigned int handle_tcp(struct sk_buff *skb, struct iphdr *ip_header)
 {
     struct tcphdr *tcp_header = tcp_hdr(skb);
+    unsigned int ret;
     if (tcp_header->syn)
     {
-        // TODO: Match Rules
         printk("NEW TCP Connection %pI4:%u -> %pI4:%u",
                &ip_header->saddr,
                ntohs(tcp_header->source),
                &ip_header->daddr,
                ntohs(tcp_header->dest));
-        return act2nfact(tcp_match_rule(ip_header->saddr, ip_header->daddr, tcp_header->source,
-                                        tcp_header->dest));
+        ret = act2nfact(tcp_match_rule(ip_header->saddr, ip_header->daddr, tcp_header->source,
+                                       tcp_header->dest, 1));
+        if (ret == NF_ACCEPT)
+        {
+            unsigned long tmp = 0;
+            ConnNode *c = (ConnNode *)kmalloc(sizeof(ConnNode), GFP_KERNEL);
+            c->c.saddr = ip_header->saddr;
+            c->c.daddr = ip_header->daddr;
+            c->c.sport = tcp_header->source;
+            c->c.dport = tcp_header->dest;
+            c->c.protocol = TCP;
+            spin_lock_irqsave(&conns_lock, tmp);
+            hash_add(conn_table, &(c->hlist), hash_conn_c(&c->c));
+            conn_num++;
+            printk("%d\n", conn_num);
+            spin_unlock_irqrestore(&conns_lock, tmp);
+        }
     }
     else
     {
@@ -301,7 +360,7 @@ inline unsigned int handle_tcp(struct sk_buff *skb, struct iphdr *ip_header)
                &ip_header->daddr,
                ntohs(tcp_header->dest));
         return act2nfact(tcp_match_rule(ip_header->saddr, ip_header->daddr, tcp_header->source,
-                                        tcp_header->dest));
+                                        tcp_header->dest, 0));
     }
     return act2nfact(default_action);
 }
@@ -313,7 +372,6 @@ int handle_udp(struct sk_buff *skb, struct iphdr *ip_header)
            ntohs(udp_header->source),
            &ip_header->daddr,
            ntohs(udp_header->dest));
-    // show_rules();
     return act2nfact(default_action);
 }
 int handle_icmp(struct sk_buff *skb, struct iphdr *ip_header)
@@ -359,6 +417,8 @@ static struct nf_hook_ops firewall_nfhook_prerouting = {
 static int __init toytable_init(void)
 {
     printk("toytable init\n");
+    hash_init(conn_table);
+
     netlink_socket = netlink_kernel_create(&init_net, NETLINK_USER, &netlink_cfg);
     if (!netlink_socket)
     {
@@ -366,7 +426,6 @@ static int __init toytable_init(void)
         return -1;
     }
     nf_register_net_hook(&init_net, &firewall_nfhook_prerouting);
-
     printk("netlink_kernel_create() success, netlink_socket = %p\n", netlink_socket);
 
     return 0;

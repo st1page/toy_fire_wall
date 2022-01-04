@@ -24,6 +24,8 @@ void print_help()
     puts("        toytables delrule rulenum(count from 1)");
     puts("        toytables setdefaultaction [accept|drop|reject]");
     puts("        toytables rules");
+    puts("        toytables save filename");
+    puts("        toytables load filename");
     puts("        toytables connections");
     puts("        toytables logs");
     puts("        toytables help");
@@ -380,6 +382,23 @@ void setdefaultaction(RuleAction action)
 }
 void showconnections()
 {
+    NetlinkRequest req;
+    NetlinkResponse *resp;
+
+    memset(&req, 0, sizeof(req));
+    req.cmd = REQ_CONNS;
+    send_to_kernel(&req, sizeof(req));
+    resp = recive_from_kernel();
+    printf("%-17s%-9s%-17s%-9s%-9s\n", "src_addr", "src_port", "dst_addr", "dst_port", "protocol");
+    for (int i = 0; i < resp->elem_num; i++)
+    {
+        printf("%-17s%-9s%-17s%-9s%-9s\n",
+               addr2str(resp->conn[i].saddr),
+               port2str(resp->conn[i].sport),
+               addr2str(resp->conn[i].daddr),
+               port2str(resp->conn[i].dport),
+               proto2str(resp->conn[i].protocol));
+    }
 }
 void showlogs()
 {
