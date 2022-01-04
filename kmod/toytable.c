@@ -4,10 +4,14 @@
 #include <linux/skbuff.h>
 #include <linux/init.h>
 #include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 #include <linux/types.h>
 #include <linux/sched.h>
 #include <linux/netlink.h>
 #include <net/sock.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
 
 struct sock *netlink_socket = NULL;
 char *addr2str(unsigned int ip)
@@ -104,6 +108,39 @@ NetlinkResponse *get_rules(void)
     }
     return resp;
 }
+RuleAction default_action = ACCEPT;
+RuleAction match_rule(uint32_t saddr, uint16_t sport, uint32_t daddr, uint16_t dport, Proto protocol)
+{
+    struct list_head *c;
+    RuleNode *r;
+    list_for_each(c, &rules)
+    {
+        r = list_entry(c, RuleNode, list);
+        continue;
+        // if ((r->rule.enable & RULE_ENABLE_SADDR) && (r->rule.saddr) != saddr)
+        // {
+        //     continue;
+        // }
+        // if ((r->rule.enable & RULE_ENABLE_SPORT) && (r->rule.sport) != source)
+        // {
+        //     continue;
+        // }
+        // if ((r->rule.enable & RULE_ENABLE_DADDR) && (r->rule.daddr) != daddr)
+        // {
+        //     continue;
+        // }
+        // if ((r->rule.enable & RULE_ENABLE_DPORT) && (r->rule.dport) != dest)
+        // {
+        //     continue;
+        // }
+        // if ((r->rule.enable & RULE_ENABLE_PROTOCOL) && (r->rule.protocol) != protocol)
+        // {
+        //     continue;
+        // }
+        return r->rule.action;
+    }
+    return default_action;
+}
 
 int netlink_send(void *data, int len, int pid)
 {
@@ -177,6 +214,13 @@ static void netlink_recv(struct sk_buff *skb)
                 resp.elem_num = del_rule(req->id);
                 netlink_send(&resp, response_size(resp.cmd, resp.elem_num), pid);
                 break;
+            case REQ_SET_DEFAULT_ACTION:
+                printk("netlink recv cmd set default action\n");
+                default_action = req->rule.action;
+                resp.cmd = RESP_ACK;
+                resp.elem_num = 1;
+                netlink_send(&resp, response_size(resp.cmd, resp.elem_num), pid);
+                break;
             default:
                 printk("netlink: Unknow message recieved\n");
             }
@@ -188,10 +232,94 @@ static void netlink_recv(struct sk_buff *skb)
     }
 }
 
+int act2nfact(RuleAction action)
+{
+    switch (action)
+    {
+    case ACCEPT:
+        return NF_ACCEPT;
+    case DROP:
+        return NF_DROP;
+    case REJECT:
+        return NF_DROP;
+    }
+    return NF_ACCEPT;
+}
+inline unsigned int handle_tcp(struct sk_buff *skb, struct iphdr *ip_header)
+{
+    struct tcphdr *tcp_header = tcp_hdr(skb);
+    if (tcp_header->syn)
+    {
+        // TODO: Match Rules
+        printk("NEW TCP Connection %pI4:%hd -> %pI4:%hd",
+               &ip_header->saddr,
+               ntohs(tcp_header->source),
+               &ip_header->daddr,
+               ntohs(tcp_header->dest));
+    }
+    else
+    {
+        printk("TCP Package %pI4:%hd -> %pI4:%hd",
+               &ip_header->saddr,
+               ntohs(tcp_header->source),
+               &ip_header->daddr,
+               ntohs(tcp_header->dest));
+        return act2nfact(match_rule(ip_header->saddr, ip_header->daddr, tcp_header->source,
+                                    tcp_header->dest, TCP));
+    }
+    return act2nfact(default_action);
+}
+int handle_udp(struct sk_buff *skb, struct iphdr *ip_header)
+{
+    struct udphdr *udp_header = udp_hdr(skb);
+    printk("UDP Package %pI4:%hd -> %pI4:%hd",
+           &ip_header->saddr,
+           ntohs(udp_header->source),
+           &ip_header->daddr,
+           ntohs(udp_header->dest));
+    // show_rules();
+    return act2nfact(default_action);
+}
+int handle_icmp(struct sk_buff *skb, struct iphdr *ip_header)
+{
+    printk("ICMP Package %pI4 -> %pI4",
+           &ip_header->saddr,
+           &ip_header->daddr);
+    // show_rules();
+    return act2nfact(default_action);
+}
+unsigned int hook_func(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+{
+    struct iphdr *ip_header;
+    unsigned int ret;
+    ip_header = ip_hdr(skb);
+    switch (ip_header->protocol)
+    {
+    case IPPROTO_TCP:
+        ret = handle_tcp(skb, ip_header);
+        break;
+    case IPPROTO_UDP:
+        ret = handle_udp(skb, ip_header);
+        break;
+    case IPPROTO_ICMP:
+        ret = NF_ACCEPT;
+        break;
+    default:
+        ret = NF_ACCEPT;
+        break;
+    }
+
+    return ret;
+}
 struct netlink_kernel_cfg netlink_cfg = {
     .input = netlink_recv,
 };
-
+static struct nf_hook_ops firewall_nfhook_prerouting = {
+    .hooknum = NF_INET_PRE_ROUTING,
+    .pf = PF_INET,
+    .hook = hook_func,
+    .priority = NF_IP_PRI_FIRST,
+};
 static int __init toytable_init(void)
 {
     printk("toytable init\n");
@@ -201,7 +329,10 @@ static int __init toytable_init(void)
         printk(KERN_ERR "can not create a netlink socket\n");
         return -1;
     }
+    nf_register_net_hook(&init_net, &firewall_nfhook_prerouting);
+
     printk("netlink_kernel_create() success, netlink_socket = %p\n", netlink_socket);
+
     return 0;
 }
 
@@ -213,6 +344,8 @@ static void __exit toytable_exit(void)
         netlink_kernel_release(netlink_socket);
         netlink_socket = NULL;
     }
+    nf_unregister_net_hook(&init_net, &firewall_nfhook_prerouting);
+
     printk("toytable exit success!\n");
 }
 MODULE_LICENSE("MIT");

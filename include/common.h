@@ -40,7 +40,8 @@ typedef enum
     REQ_CONNS = 1,
     REQ_RULES,
     REQ_ADD_RULE,
-    REQ_DEL_RULE
+    REQ_DEL_RULE,
+    REQ_SET_DEFAULT_ACTION,
 } ReqCmd;
 typedef struct
 {

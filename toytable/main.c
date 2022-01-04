@@ -22,6 +22,7 @@ void print_help()
     puts("            --state [new|established]     link state");
     puts("            --action [accept|drop|reject] action");
     puts("        toytables delrule rulenum(count from 1)");
+    puts("        toytables setdefaultaction [accept|drop|reject]");
     puts("        toytables rules");
     puts("        toytables connections");
     puts("        toytables logs");
@@ -360,6 +361,25 @@ void showrules()
     for (int i = 0; i < resp->elem_num; i++)
         println_rule(resp->rule[i]);
 }
+void setdefaultaction(RuleAction action)
+{
+    NetlinkRequest req;
+    NetlinkResponse *resp;
+
+    memset(&req, 0, sizeof(req));
+    req.cmd = REQ_SET_DEFAULT_ACTION;
+    req.rule.action = action;
+    send_to_kernel(&req, sizeof(req));
+    resp = recive_from_kernel();
+    if (resp->cmd != RESP_ACK || resp->elem_num != 1)
+    {
+        puts("wrong resp");
+    }
+    else
+    {
+        puts("delete success!");
+    }
+}
 void showconnections()
 {
 }
@@ -391,6 +411,16 @@ int main(int argc, char *argv[])
     case 'r':
         showrules();
         break;
+    case 's':
+        if (argc != 3)
+        {
+            puts("unexpected arg counts");
+            print_help();
+            break;
+        }
+        setdefaultaction(get_action(argv[2]));
+        break;
+
     case 'c':
         showconnections();
         break;
